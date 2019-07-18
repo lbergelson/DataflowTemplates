@@ -36,7 +36,7 @@
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <avro.version>1.8.2</avro.version>
+    <avro.version>1.9.0</avro.version>
     <checkstyle.version>8.7</checkstyle.version>
     <beam.version>2.12.0</beam.version>
     <beam-vendor-guava.version>0.1</beam-vendor-guava.version>
@@ -87,6 +87,11 @@
   </properties>
 
   <dependencies>
+    <dependency>
+      <groupId>com.google.cloud</groupId>
+      <artifactId>google-cloud-nio</artifactId>
+      <version>0.81.0-alpha</version>
+    </dependency>
     <!-- Beam -->
     <dependency>
       <groupId>org.apache.beam</groupId>
