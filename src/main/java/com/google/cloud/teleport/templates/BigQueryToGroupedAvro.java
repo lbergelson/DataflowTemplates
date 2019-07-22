@@ -18,8 +18,6 @@ package com.google.cloud.teleport.templates;
 
 import com.google.cloud.storage.contrib.nio.CloudStorageFileSystem;
 import com.google.cloud.teleport.templates.common.BigQueryConverters.BigQueryReadOptions;
-import com.google.cloud.teleport.templates.common.DatastoreConverters.DatastoreWriteOptions;
-import com.google.cloud.teleport.templates.common.ErrorConverters.ErrorWriteOptions;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.file.FileSystemNotFoundException;
@@ -28,8 +26,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.ProviderNotFoundException;
+import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.UUID;
@@ -45,12 +43,19 @@ import org.apache.beam.sdk.io.TextIO;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO;
 import org.apache.beam.sdk.io.gcp.bigquery.SchemaAndRecord;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
+import org.apache.beam.sdk.transforms.Combine;
+import org.apache.beam.sdk.transforms.Combine.CombineFn;
 import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.DoFn.Element;
+import org.apache.beam.sdk.transforms.DoFn.ProcessElement;
 import org.apache.beam.sdk.transforms.GroupByKey;
+import org.apache.beam.sdk.transforms.MapElements;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.transforms.SerializableFunction;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.TypeDescriptor;
+import org.apache.beam.sdk.values.TypeDescriptors;
 import org.broadinstitute.gatk.avro.GenotypeRow;
 import org.broadinstitute.gatk.avro.GenotypeSubRow;
 import org.broadinstitute.gatk.avro.MultiGenotypeGroup;
@@ -72,12 +77,12 @@ public class BigQueryToGroupedAvro {
 
     private static final String uuid = UUID.randomUUID().toString();
     private static final String outputDir = "gs://lb_spec_ops_test/"+uuid;
-    interface BigQueryToDatastoreOptions
-        extends BigQueryReadOptions {}
+    interface BigQueryToDatastoreOptions extends BigQueryReadOptions {}
 
-        private static int getShardKey(long position){
-            return (int)(position / SHARD_LENGTH);
-        }
+    private static  int getShardKey(long position, long shardLength){
+        return (int)(position / shardLength);
+    }
+
 
 
     public static void main(String[] args) {
@@ -88,51 +93,33 @@ public class BigQueryToGroupedAvro {
         Pipeline pipeline = Pipeline.create(options);
 
         final PCollection<GenotypeRow> joinedData = pipeline.apply("Query Data from BQ",
-            BigQueryIO.read((SerializableFunction<SchemaAndRecord, GenotypeRow>) row -> {
-                final GenericRecord record = row.getRecord();
-                return GenotypeRow.newBuilder()
-                    .setPosition((Long)record.get("position"))
-                    .setSample((CharSequence) record.get("sample"))
-                    .setState((CharSequence) record.get("state"))
-                    .setRef((CharSequence) record.get("ref"))
-                    .setAlt((CharSequence) record.get("alt"))
-                    .setASRAWMQ((CharSequence) record.get("AS_RAW_MQ"))
-                    .setASRAWMQRankSum((CharSequence) record.get("AS_RAW_MQRankSum"))
-                    .setASQUALapprox((CharSequence) record.get("AS_QUALapprox"))
-                    .setASRAWReadPosRankSum((CharSequence) record.get("AS_RAW_ReadPosRankSum"))
-                    .setASSBTABLE((CharSequence) record.get("AS_SB_TABLE"))
-                    .setASVarDP((CharSequence) record.get("AS_VarDP"))
-                    .setCallGT((CharSequence) record.get("call_GT"))
-                    .setCallAD((CharSequence) record.get("call_AD"))
-                    .setCallDP((Long) record.get("call_DP"))
-                    .setCallGQ((Long) record.get("call_GQ"))
-                    .setCallPGT((CharSequence) record.get("call_PGT"))
-                    .setCallPID((CharSequence) record.get("call_PID"))
-                    .setCallPL((CharSequence) record.get("call_PL"))
-                    .build();
-            })
+            BigQueryIO.read(BigQueryToGroupedAvro::schemaAndRecordToGenotypeRow)
+                .from("lb_test.lb_dalio3_grouped_complete")
                 //.from("lb_test.saved_join_dalio3_small")
-                .fromQuery(QUERY)
-                .usingStandardSql()
+                //.fromQuery(QUERY)
+                //.usingStandardSql()
                 .withCoder(AvroCoder.of(GenotypeRow.class)));
 
+        final PCollection<KV<Long, GenotypeRow>> perRowKeys = joinedData.apply("Add position key", MapElements
+            .into(TypeDescriptors.kvs(TypeDescriptors.longs(), TypeDescriptor.of(GenotypeRow.class)))
+            .via((SerializableFunction<GenotypeRow, KV<Long, GenotypeRow>>) (row -> KV
+                .of(row.getPosition(), row))));
 
-        final PCollection<KV<Integer, GenotypeRow>> keyedRows = joinedData
-            .apply("Generate Range Keys", ParDo.of(new DoFn<GenotypeRow, KV<Integer, GenotypeRow>>() {
-                @ProcessElement
-                public void processElement(@Element GenotypeRow row, OutputReceiver<KV<Integer, GenotypeRow>> out) {
-                    out.output(KV.of(getShardKey(row.getPosition()), row));
-                }
-            }));
+        final PCollection<KV<Long, MultiGenotypeGroup>> combinedRows = perRowKeys
+            .apply("Combine same position", Combine.perKey(new CombineRecordsAtAGivenPosition()));
 
+        final PCollection<KV<Integer, MultiGenotypeGroup>> sharded = combinedRows.apply("Convert position to shard number", MapElements
+            .into(TypeDescriptors.kvs(TypeDescriptors.integers(), TypeDescriptor.of(MultiGenotypeGroup.class)))
+            .via((SerializableFunction<KV<Long, MultiGenotypeGroup>, KV<Integer, MultiGenotypeGroup>>) (
+                row -> KV.of(getShardKey(row.getKey(), SHARD_LENGTH), row.getValue()))));
 
-        final PCollection<KV<Integer, Iterable<GenotypeRow>>> groupedByKeys = keyedRows
+        final PCollection<KV<Integer, Iterable<MultiGenotypeGroup>>> groupedByKeys = sharded
             .apply("Group by RangeKeys", GroupByKey.create());
 
-        final PCollection<String> outFiles = groupedByKeys.apply("Custom Local Sorter",
-            ParDo.of(new DoFn<KV<Integer, Iterable<GenotypeRow>>, String>() {
+        final PCollection<String> outFiles = groupedByKeys.apply("Sort and write to avro",
+            ParDo.of(new DoFn<KV<Integer, Iterable<MultiGenotypeGroup>>, String>() {
                 @ProcessElement
-                public void processElement(@Element KV<Integer, Iterable<GenotypeRow>> values,
+                public void processElement(@Element KV<Integer, Iterable<MultiGenotypeGroup>> values,
                     OutputReceiver<String> out) throws IOException {
                     DatumWriter<MultiGenotypeGroup> datumWriter = new SpecificDatumWriter<MultiGenotypeGroup>(MultiGenotypeGroup.class);
                     String outFilePath = outputDir + "/" + String.format("%06d.avro", values.getKey());
@@ -141,16 +128,9 @@ public class BigQueryToGroupedAvro {
                         dataFileWriter.create(MultiGenotypeGroup.getClassSchema(), Files.newOutputStream(getPath(outFilePath)));
 
                         StreamSupport.stream(values.getValue().spliterator(), false)
-                            .collect(Collectors.groupingBy(GenotypeRow::getPosition))
-                            .forEach( (position, rows) -> {
-                                final Builder builder = MultiGenotypeGroup.newBuilder()
-                                    .setPosition(position);
-                                final List<GenotypeSubRow> subrows = rows.stream()
-                                    .map(BigQueryToGroupedAvro::rowToRowWithNoPosition)
-                                    .collect(Collectors.toList());
-                                builder.setValues(subrows);
+                            .forEach( value -> {
                                 try {
-                                    dataFileWriter.append(builder.build());
+                                    dataFileWriter.append(value);
                                 } catch (IOException e) {
                                     throw new RuntimeException(e);
                                 }
@@ -161,13 +141,37 @@ public class BigQueryToGroupedAvro {
                 }
             }));
 
-        outFiles.apply(TextIO.write()
+        outFiles.apply("Write file names", TextIO.write()
             .to(outputDir)
             .withNumShards(1)
             .withSuffix(".list"));
 
 
         pipeline.run();
+    }
+
+    private static GenotypeRow schemaAndRecordToGenotypeRow(SchemaAndRecord row) {
+        final GenericRecord record = row.getRecord();
+        return GenotypeRow.newBuilder()
+            .setPosition((Long)record.get("position"))
+            .setSample((CharSequence) record.get("sample"))
+            .setState((CharSequence) record.get("state"))
+            .setRef((CharSequence) record.get("ref"))
+            .setAlt((CharSequence) record.get("alt"))
+            .setASRAWMQ((CharSequence) record.get("AS_RAW_MQ"))
+            .setASRAWMQRankSum((CharSequence) record.get("AS_RAW_MQRankSum"))
+            .setASQUALapprox((CharSequence) record.get("AS_QUALapprox"))
+            .setASRAWReadPosRankSum((CharSequence) record.get("AS_RAW_ReadPosRankSum"))
+            .setASSBTABLE((CharSequence) record.get("AS_SB_TABLE"))
+            .setASVarDP((CharSequence) record.get("AS_VarDP"))
+            .setCallGT((CharSequence) record.get("call_GT"))
+            .setCallAD((CharSequence) record.get("call_AD"))
+            .setCallDP((Long) record.get("call_DP"))
+            .setCallGQ((Long) record.get("call_GQ"))
+            .setCallPGT((CharSequence) record.get("call_PGT"))
+            .setCallPID((CharSequence) record.get("call_PID"))
+            .setCallPL((CharSequence) record.get("call_PL"))
+            .build();
     }
 
     private static GenotypeSubRow rowToRowWithNoPosition(
@@ -242,6 +246,42 @@ public class BigQueryToGroupedAvro {
             catch ( IOException io ) {
                 throw new RuntimeException(uriString + " is not a supported path", io);
             }
+        }
+    }
+
+    private static class CombineRecordsAtAGivenPosition extends
+        CombineFn<GenotypeRow, MultiGenotypeGroup, MultiGenotypeGroup> {
+
+        @Override
+        public MultiGenotypeGroup createAccumulator() {
+            return new MultiGenotypeGroup(-1L, new ArrayList<>());
+        }
+
+        @Override
+        public MultiGenotypeGroup addInput(MultiGenotypeGroup accumulator,
+            GenotypeRow input) {
+            accumulator.setPosition(input.getPosition());
+            accumulator.getValues().add(rowToRowWithNoPosition(input));
+            return accumulator;
+        }
+
+        @Override
+        public MultiGenotypeGroup mergeAccumulators(
+            Iterable<MultiGenotypeGroup> accumulators) {
+            MultiGenotypeGroup first = null;
+            for (MultiGenotypeGroup accumulator : accumulators) {
+                if (first == null) {
+                    first = accumulator;
+                } else {
+                    first.getValues().addAll(accumulator.getValues());
+                }
+            }
+            return first;
+        }
+
+        @Override
+        public MultiGenotypeGroup extractOutput(MultiGenotypeGroup accumulator) {
+            return accumulator;
         }
     }
 }
