@@ -28,8 +28,13 @@ import java.nio.file.Paths;
 import java.nio.file.ProviderNotFoundException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.List;
+import java.util.TreeMap;
 import java.util.UUID;
+import java.util.stream.Collector;
+import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 import org.apache.avro.file.DataFileWriter;
 import org.apache.avro.generic.GenericRecord;
@@ -37,7 +42,10 @@ import org.apache.avro.io.DatumWriter;
 import org.apache.avro.specific.SpecificDatumWriter;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.coders.AvroCoder;
+import org.apache.beam.sdk.coders.KvCoder;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
+import org.apache.beam.sdk.coders.TextualIntegerCoder;
+import org.apache.beam.sdk.coders.VarIntCoder;
 import org.apache.beam.sdk.io.TextIO;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.TypedRead.Method;
@@ -70,7 +78,7 @@ public class BigQueryToGroupedAvro {
         + "LEFT OUTER JOIN `" + table + ".vet`\n"
         + "USING (position, sample)"; //\n"
        // + "WHERE ( position >= 10000000 AND position < 10010000 )";
-    public static final long SHARD_LENGTH = 1_000;
+    public static final long SHARD_LENGTH = 10_000;
 
 
     private static final String uuid = UUID.randomUUID().toString();
@@ -109,6 +117,64 @@ public class BigQueryToGroupedAvro {
                 .withMethod(Method.DIRECT_READ)
                 .withCoder(AvroCoder.of(GenotypeRow.class)));
 
+
+
+        final PCollection<String> outFiles = groupByShard(joinedData);
+
+        outFiles.apply("Write file names", TextIO.write()
+            .to(outputDir)
+            .withNumShards(1)
+            .withSuffix(".list"));
+
+        pipeline.run();
+    }
+
+    private static PCollection<String> groupByShard(PCollection<GenotypeRow> joinedData) {
+        final PCollection<KV<Integer, GenotypeRow>> withShardKeys = joinedData.apply("Add shard key", MapElements
+            .into(TypeDescriptors.kvs(TypeDescriptors.integers(), TypeDescriptor.of(GenotypeRow.class)))
+            .via((SerializableFunction<GenotypeRow, KV<Integer, GenotypeRow>>) (row -> KV
+                .of(getShardKey(row.getPosition(), SHARD_LENGTH), row))))
+            .setCoder(KvCoder.of(VarIntCoder.of(), AvroCoder.of(GenotypeRow.class)));
+
+
+        final PCollection<KV<Integer, Iterable<GenotypeRow>>> groupedByKeys = withShardKeys
+            .apply("Group into Shards", GroupByKey.create());
+
+        return groupedByKeys.apply("Sort and write to avro",
+            ParDo.of(new DoFn<KV<Integer, Iterable<GenotypeRow>>, String>() {
+                @ProcessElement
+                public void processElement(@Element KV<Integer, Iterable<GenotypeRow>> values,
+                    OutputReceiver<String> out) throws IOException {
+                    DatumWriter<MultiGenotypeGroup> datumWriter = new SpecificDatumWriter<>(MultiGenotypeGroup.class);
+                    String outFilePath = outputDir + "/" + String.format("%06d.avro", values.getKey());
+
+                    try(final DataFileWriter<MultiGenotypeGroup> dataFileWriter = new DataFileWriter<>(datumWriter)) {
+                        dataFileWriter.create(MultiGenotypeGroup.getClassSchema(), Files.newOutputStream(getPath(outFilePath)));
+
+                        final TreeMap<Long, List<GenotypeSubRow>> collected = StreamSupport
+                            .stream(values.getValue().spliterator(), false)
+                            .collect(Collectors.groupingBy(
+                                GenotypeRow::getPosition,
+                                TreeMap::new,
+                                Collector.of(
+                                    ArrayList::new,
+                                    (List<GenotypeSubRow> list, GenotypeRow value) -> list.add(rowToRowWithNoPosition(value)),
+                                    (list1, list2) -> { list1.addAll(list2); return list1; })
+                            ));
+                           collected.forEach( (position, subRows) -> {
+                                try {
+                                    dataFileWriter.append(new MultiGenotypeGroup(position, subRows));
+                                } catch (IOException e) {
+                                    throw new RuntimeException(e);
+                                }
+                            });
+                    }
+                    out.output(outFilePath);
+                }
+            }));
+    }
+
+    private static PCollection<String> preGroupByPosition(PCollection<GenotypeRow> joinedData) {
         final PCollection<KV<Long, GenotypeRow>> perRowKeys = joinedData.apply("Add position key", MapElements
             .into(TypeDescriptors.kvs(TypeDescriptors.longs(), TypeDescriptor.of(GenotypeRow.class)))
             .via((SerializableFunction<GenotypeRow, KV<Long, GenotypeRow>>) (row -> KV
@@ -125,7 +191,7 @@ public class BigQueryToGroupedAvro {
         final PCollection<KV<Integer, Iterable<MultiGenotypeGroup>>> groupedByKeys = sharded
             .apply("Group by RangeKeys", GroupByKey.create());
 
-        final PCollection<String> outFiles = groupedByKeys.apply("Sort and write to avro",
+        return groupedByKeys.apply("Sort and write to avro",
             ParDo.of(new DoFn<KV<Integer, Iterable<MultiGenotypeGroup>>, String>() {
                 @ProcessElement
                 public void processElement(@Element KV<Integer, Iterable<MultiGenotypeGroup>> values,
@@ -137,7 +203,8 @@ public class BigQueryToGroupedAvro {
                         dataFileWriter.create(MultiGenotypeGroup.getClassSchema(), Files.newOutputStream(getPath(outFilePath)));
 
                         StreamSupport.stream(values.getValue().spliterator(), false)
-                            .forEach( value -> {
+                            .sorted(Comparator.comparingLong(MultiGenotypeGroup::getPosition))
+                            .forEachOrdered( value -> {
                                 try {
                                     dataFileWriter.append(value);
                                 } catch (IOException e) {
@@ -149,13 +216,6 @@ public class BigQueryToGroupedAvro {
 
                 }
             }));
-
-        outFiles.apply("Write file names", TextIO.write()
-            .to(outputDir)
-            .withNumShards(1)
-            .withSuffix(".list"));
-
-        pipeline.run();
     }
 
     private static GenotypeRow schemaAndRecordToGenotypeRow(SchemaAndRecord row) {
