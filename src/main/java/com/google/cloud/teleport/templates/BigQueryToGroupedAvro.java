@@ -29,9 +29,7 @@ import java.nio.file.ProviderNotFoundException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
-import java.util.List;
 import java.util.UUID;
-import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 import org.apache.avro.file.DataFileWriter;
 import org.apache.avro.generic.GenericRecord;
@@ -39,15 +37,15 @@ import org.apache.avro.io.DatumWriter;
 import org.apache.avro.specific.SpecificDatumWriter;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.coders.AvroCoder;
+import org.apache.beam.sdk.coders.StringUtf8Coder;
 import org.apache.beam.sdk.io.TextIO;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO;
+import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.TypedRead.Method;
 import org.apache.beam.sdk.io.gcp.bigquery.SchemaAndRecord;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.transforms.Combine;
 import org.apache.beam.sdk.transforms.Combine.CombineFn;
 import org.apache.beam.sdk.transforms.DoFn;
-import org.apache.beam.sdk.transforms.DoFn.Element;
-import org.apache.beam.sdk.transforms.DoFn.ProcessElement;
 import org.apache.beam.sdk.transforms.GroupByKey;
 import org.apache.beam.sdk.transforms.MapElements;
 import org.apache.beam.sdk.transforms.ParDo;
@@ -59,11 +57,11 @@ import org.apache.beam.sdk.values.TypeDescriptors;
 import org.broadinstitute.gatk.avro.GenotypeRow;
 import org.broadinstitute.gatk.avro.GenotypeSubRow;
 import org.broadinstitute.gatk.avro.MultiGenotypeGroup;
-import org.broadinstitute.gatk.avro.MultiGenotypeGroup.Builder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class BigQueryToGroupedAvro {
+
     private static final Logger LOG = LoggerFactory.getLogger(BigQueryToGroupedAvro.class);
 
     private static  final String table = "broad-dsp-spec-ops.joint_genotyping_chr20_dalio_3_updated";
@@ -77,7 +75,9 @@ public class BigQueryToGroupedAvro {
 
     private static final String uuid = UUID.randomUUID().toString();
     private static final String outputDir = "gs://lb_spec_ops_test/"+uuid;
-    interface BigQueryToDatastoreOptions extends BigQueryReadOptions {}
+    private static final String SAMPLE_NAME_TABLE = "joint_genotyping_chr20_dalio_3.sample_list";
+
+    public interface BigQueryToDatastoreOptions extends BigQueryReadOptions {}
 
     private static  int getShardKey(long position, long shardLength){
         return (int)(position / shardLength);
@@ -91,6 +91,14 @@ public class BigQueryToGroupedAvro {
             PipelineOptionsFactory.fromArgs(args).withValidation().as(BigQueryToDatastoreOptions.class);
 
         Pipeline pipeline = Pipeline.create(options);
+        pipeline.apply("Get Sample names", BigQueryIO
+            .read(row -> String.valueOf(row.getRecord().get("sample")))
+            .from(SAMPLE_NAME_TABLE)
+            .withCoder(StringUtf8Coder.of()))
+            .apply("Write sample names to a file", TextIO.write()
+                .to(outputDir)
+                .withNumShards(1)
+                .withSuffix(".sample_names"));
 
         final PCollection<GenotypeRow> joinedData = pipeline.apply("Query Data from BQ",
             BigQueryIO.read(BigQueryToGroupedAvro::schemaAndRecordToGenotypeRow)
@@ -98,6 +106,7 @@ public class BigQueryToGroupedAvro {
                 //.from("lb_test.saved_join_dalio3_small")
                 //.fromQuery(QUERY)
                 //.usingStandardSql()
+                .withMethod(Method.DIRECT_READ)
                 .withCoder(AvroCoder.of(GenotypeRow.class)));
 
         final PCollection<KV<Long, GenotypeRow>> perRowKeys = joinedData.apply("Add position key", MapElements
@@ -145,7 +154,6 @@ public class BigQueryToGroupedAvro {
             .to(outputDir)
             .withNumShards(1)
             .withSuffix(".list"));
-
 
         pipeline.run();
     }
@@ -284,4 +292,5 @@ public class BigQueryToGroupedAvro {
             return accumulator;
         }
     }
+
 }
